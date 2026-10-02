@@ -1,0 +1,33 @@
+# ============================================================
+#  LED strip settings  -  edit and save, changes apply within 1 second
+#  (no restart needed). Lines starting with # are ignored.
+# ============================================================
+
+# Total number of LEDs on the strip
+led_count = 60
+
+# Overall brightness in percent (1-100). Keep it low if your power supply is small.
+brightness = 50
+
+# What each switch position lights up:
+#   positionN = FIRST-LAST COLOR
+# LED numbers start at 0, both ends are included.
+# COLOR is a name (white green orange red blue yellow purple cyan pink)
+# or R,G,B numbers 0-255, e.g.  255,80,0
+position1 = 0-9 white
+position2 = 10-19 green
+position3 = 20-29 orange
+position4 = 30-39 red
+
+# Rainbow shown when the switch is turned
+rainbow_seconds = 2
+# How fast the rainbow moves (full rainbow turns per second)
+rainbow_speed = 1
+
+# --- wiring, normally no need to change ---
+# GPIO numbers (BCM) for switch position 1 2 3 4. Each is connected to GND
+# through the switch when that position is selected.
+switch_pins = 5 6 13 19
+
+# Color byte order of the strip. WS2812B is GRB. If red and green are swapped, try RGB.
+color_order = GRB
