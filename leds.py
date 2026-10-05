@@ -6,17 +6,18 @@ selected: all LEDs off). A rotary encoder toggles a rainbow mode when pressed
 and changes the rainbow speed when turned. Every change of what is shown
 plays a transition: glitch, steampunk, rainbow or none.
 
-Based on https://github.com/0x0SegFault/ledstrip (MIT).
+The display can also be set from the command line (for example over SSH).
+A command stays active until the switch or the encoder is used: manual
+changes always take over.
 
-Usage:
-  leds.py            run (normally started by systemd: leds.service)
-  leds.py identify   help find LED numbers: every 10th LED red, every 5th green
+Based on https://github.com/0x0SegFault/ledstrip (MIT).
 """
 import colorsys
 import os
 import queue
 import random
 import signal
+import socket
 import sys
 import time
 
@@ -26,7 +27,9 @@ os.environ.setdefault("LG_WD", "/tmp")
 import spidev
 from gpiozero import Button, Device, DigitalInputDevice, RotaryEncoder
 
-CONF = os.path.join(os.path.dirname(os.path.abspath(__file__)), "leds.conf")
+HERE = os.path.dirname(os.path.abspath(__file__))
+CONF = os.path.join(HERE, "leds.conf")
+SOCK = os.path.join(HERE, "leds.sock")  # commands sent with the leds CLI
 
 COLORS = {
     # Official TLP 2.0 colors (FIRST / CISA)
@@ -260,9 +263,9 @@ def fit(frame, n):
     return (list(frame) + [BLACK] * n)[:n]
 
 
-def static_frame(cfg, position):
+def static_frame(cfg, state):
     pixels = [BLACK] * cfg["led_count"]
-    seg = cfg["segments"][position - 1] if position else None
+    seg = cfg["segments"][state - 1] if isinstance(state, int) else None
     if seg:
         first, last, color, _ = seg
         for i in range(max(first, 0), min(last, cfg["led_count"] - 1) + 1):
@@ -337,16 +340,340 @@ def transition_frame(cfg, prev, target, p, elapsed):
     return rainbow_frame(len(target), elapsed * cfg["rainbow_speed"], cfg["rainbow_brightness"])
 
 
-def describe(cfg, display):
-    if display == "rainbow":
-        return "rainbow"
-    if not display:
-        return "off (no position selected)"
-    seg = cfg["segments"][display - 1]
-    return f"position {display}: LEDs {seg[0]}-{seg[1]} {seg[3]}" if seg else f"position {display}: nothing set"
+def describe(cfg, state):
+    """Human readable name of a display state: "off", "rainbow" or a position 1-4."""
+    if not isinstance(state, int):
+        return state
+    seg = cfg["segments"][state - 1]
+    return f"position {state} ({seg[3]}, LEDs {seg[0]}-{seg[1]})" if seg else f"position {state} (nothing set)"
+
+
+# --- Command line over SSH ---
+
+class CommandServer:
+    """Unix socket the leds CLI talks to. One command per connection, one reply."""
+
+    def __init__(self, path):
+        self.path = path
+        if os.path.exists(path):
+            try:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+                    probe.connect(path)
+                raise RuntimeError("another leds controller is already running (is the service started?)")
+            except (ConnectionRefusedError, FileNotFoundError):
+                os.unlink(path)  # left over from a crash
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.bind(path)
+        os.chmod(path, 0o660)
+        self.sock.listen(4)
+        self.sock.setblocking(False)
+
+    def poll(self, handler):
+        """Answer every waiting command with handler(command) -> reply."""
+        while True:
+            try:
+                conn, _ = self.sock.accept()
+            except BlockingIOError:
+                return
+            with conn:
+                try:
+                    conn.settimeout(0.5)
+                    data = b""
+                    while b"\n" not in data and len(data) < 1024:
+                        chunk = conn.recv(256)
+                        if not chunk:
+                            break
+                        data += chunk
+                    conn.sendall((handler(data.decode().strip()) + "\n").encode())
+                except (OSError, UnicodeDecodeError):
+                    pass
+
+    def close(self):
+        self.sock.close()
+        try:
+            os.unlink(self.path)
+        except OSError:
+            pass
+
+
+def send_command(args):
+    """CLI side: send one command to the running controller and print the reply."""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(3)
+            s.connect(SOCK)
+            s.sendall((" ".join(args) + "\n").encode())
+            reply = b""
+            while True:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                reply += chunk
+    except (FileNotFoundError, ConnectionRefusedError):
+        print("The leds service is not running. Start it with: sudo systemctl start leds")
+        return 1
+    except PermissionError:
+        print("Permission denied: run this as the user the leds service runs as.")
+        return 1
+    except socket.timeout:
+        print("No answer from the leds service.")
+        return 1
+    text = reply.decode().strip()
+    print(text)
+    return 1 if text.startswith("error") else 0
+
+
+# --- Controller ---
+
+class App:
+    def __init__(self):
+        self.server = CommandServer(SOCK)
+        self.strip = Strip()
+        self.events = queue.SimpleQueue()
+        self.cfg, self.controls, self.mtime, self.next_check = None, None, None, 0
+
+        now = time.monotonic()
+        self.closed, self.candidate, self.since = (), (), now
+        self.position = "off"  # set by the switch
+        self.rainbow_mode = False  # set by the encoder button
+        self.speed, self.phase = 0.0, 0.0
+        self.override = None  # state set from the command line, None = manual control
+        self.history = []  # previous command line states, for "reset"
+        self.display = "off"
+        self.prev, self.trans_start = [], None
+        self.last_frame, self.sent_at, self.last_time = [], 0.0, now
+        self.running = True
+
+    # Configuration
+
+    def reload_config(self, now):
+        if now < self.next_check:
+            return
+        self.next_check = now + 1
+        try:
+            m = os.stat(CONF).st_mtime
+            if m == self.mtime:
+                return
+            self.mtime = m
+            new = load_config(CONF)
+            if not self.controls or not self.controls.matches(new):
+                if self.controls:
+                    self.controls.close()
+                    self.controls = None
+                self.controls = Controls(new, self.events)
+                log(f"GPIO backend: {type(Device.pin_factory).__name__}")
+            if self.cfg and self.cfg["led_count"] > new["led_count"]:
+                self.strip.show([BLACK] * self.cfg["led_count"], self.cfg)  # clear the old tail
+            if not self.cfg or new["rainbow_speed"] != self.cfg["rainbow_speed"]:
+                self.speed = new["rainbow_speed"]
+            if isinstance(self.override, int) and self.override > len(new["segments"]):
+                self.override, self.history = None, []
+            self.cfg, self.last_frame = new, []
+            log(f"Config loaded: {new['led_count']} LEDs, brightness {int(new['brightness'] * 100)}%, "
+                f"gamma {new['gamma']:g}, switch pins {new['switch_pins']} (active {new['switch_active']}), "
+                f"encoder pins {new['encoder_pins'] or 'none'}, transition {new['transition']}")
+        except ConfigError as e:
+            log(f"Config error in {CONF}: {e}" + (" (keeping previous settings)" if self.cfg else ""))
+        except Exception as e:  # file or GPIO problem
+            log(f"Error: {e} (retrying)")
+            self.mtime = None
+            self.next_check = now + 5
+
+    # Manual controls
+
+    def take_over(self, reason):
+        """A manual action cancels the command line state."""
+        if self.override is not None:
+            log(f"{reason}: manual control again, command line state released")
+        self.override, self.history = None, []
+
+    def set_speed(self, speed):
+        self.speed = round(min(SPEED_MAX, max(SPEED_MIN, speed)), 2)
+        log(f"Rainbow speed: {self.speed:g} turns/s")
+
+    def handle_encoder(self):
+        while True:
+            try:
+                event = self.events.get_nowait()
+            except queue.Empty:
+                return
+            if event == "press":
+                # Toggle relative to what is shown, so a press always visibly does something
+                self.rainbow_mode = self.display != "rainbow"
+                self.take_over("Encoder pressed")
+                log(f"Rainbow mode {'ON' if self.rainbow_mode else 'OFF'}")
+            elif self.display == "rainbow":
+                if self.override is not None:
+                    self.rainbow_mode = True
+                    self.take_over("Encoder turned")
+                self.set_speed(self.speed + event * self.cfg["rainbow_step"])
+
+    def read_switch(self, now):
+        raw = self.controls.read_switch()
+        if raw != self.candidate:
+            self.candidate, self.since = raw, now
+        elif raw != self.closed and now - self.since >= (SETTLE if raw else OFF_SETTLE):
+            self.closed = raw
+            self.position = self.controls.position(raw) or "off"
+            log(f"Switch position: {describe(self.cfg, self.position)}  (closed: "
+                f"{' '.join(f'GPIO{p}' for p in raw) or 'nothing'})")
+            self.take_over("Switch turned")
+
+    # Command line
+
+    def parse_state(self, text):
+        t = text.lower()
+        if t in ("off", "rainbow"):
+            return t
+        if t.startswith("position"):
+            t = t[len("position"):]
+        segments = self.cfg["segments"]
+        if t.isdigit() and 1 <= int(t) <= len(segments):
+            return int(t)
+        for i, seg in enumerate(segments, 1):
+            if seg:
+                label = seg[3].lower()
+                if t in (label, "tlp:" + label) or (label.startswith("tlp:") and t == label[4:]):
+                    return i
+        return None
+
+    def status(self):
+        if self.override is None:
+            control = "manual (switch and encoder)"
+        else:
+            control = f"command line, {len(self.history)} step(s) to reset back"
+        return "\n".join([
+            f"display: {describe(self.cfg, self.display)}",
+            f"control: {control}",
+            f"switch: {describe(self.cfg, self.position)}",
+            f"rainbow mode (encoder): {'on' if self.rainbow_mode else 'off'}, speed {self.speed:g} turns/s",
+            f"transition: {self.cfg['transition']}",
+        ])
+
+    def handle_command(self, line):
+        args = line.split()
+        if not args:
+            return "error: empty command"
+        cmd, rest = args[0].lower(), args[1:]
+
+        if cmd == "status":
+            return self.status()
+
+        if cmd == "set":
+            state = self.parse_state(rest[0]) if len(rest) == 1 else None
+            if state is None:
+                names = [seg[3] for seg in self.cfg["segments"] if seg]
+                return ("error: usage: leds set STATE, with STATE one of: off, rainbow, "
+                        f"1-{len(self.cfg['segments'])}, {', '.join(names)}")
+            self.history.append(self.override)
+            self.override = state
+            log(f"Command line: set {describe(self.cfg, state)}")
+            return f"ok: showing {describe(self.cfg, state)} until the switch or encoder is used"
+
+        if cmd in ("reset", "undo"):
+            if self.override is None:
+                return "nothing to reset: manual control is active"
+            self.override = self.history.pop() if self.history else None
+            if self.override is None:
+                log("Command line: reset, back to manual control")
+                return f"ok: back to manual control, showing {describe(self.cfg, self.manual_state())}"
+            log(f"Command line: reset to {describe(self.cfg, self.override)}")
+            return f"ok: back to {describe(self.cfg, self.override)}"
+
+        if cmd == "release":
+            self.override, self.history = None, []
+            log("Command line: release, back to manual control")
+            return f"ok: manual control, showing {describe(self.cfg, self.manual_state())}"
+
+        if cmd == "speed":
+            try:
+                self.set_speed(float(rest[0]))
+            except (IndexError, ValueError):
+                return f"error: usage: leds speed TURNS_PER_SECOND ({SPEED_MIN:g} to {SPEED_MAX:g})"
+            return f"ok: rainbow speed {self.speed:g} turns/s"
+
+        return f"error: unknown command '{cmd}' (try: leds help)"
+
+    # Display
+
+    def manual_state(self):
+        return "rainbow" if self.rainbow_mode else self.position
+
+    def render(self, now, dt):
+        wanted = self.override if self.override is not None else self.manual_state()
+        if wanted != self.display:
+            self.display = wanted
+            log(f"Display: {describe(self.cfg, wanted)}")
+            self.prev, self.trans_start = self.last_frame, now
+
+        cfg = self.cfg
+        n = cfg["led_count"]
+        if self.display == "rainbow":
+            self.phase = (self.phase + self.speed * dt) % 1
+            target = rainbow_frame(n, self.phase, cfg["rainbow_brightness"])
+        else:
+            target = static_frame(cfg, self.display)
+
+        frame = target
+        if self.trans_start is not None:
+            duration = cfg["transition_ms"] / 1000
+            elapsed = now - self.trans_start
+            if cfg["transition"] == "none" or elapsed >= duration:
+                self.trans_start = None
+            else:
+                frame = transition_frame(cfg, fit(self.prev, n), target, elapsed / duration, elapsed)
+
+        # Re-sent regularly so a frame garbled on the data line doesn't stick
+        animated = self.trans_start is not None or self.display == "rainbow"
+        if animated or frame != self.last_frame or now - self.sent_at >= REFRESH:
+            self.strip.show(frame, cfg)
+            self.last_frame, self.sent_at = frame, now
+
+    # Main loop
+
+    def stop(self, *_):
+        self.running = False
+
+    def run(self):
+        signal.signal(signal.SIGTERM, self.stop)
+        signal.signal(signal.SIGINT, self.stop)
+        try:
+            while self.running:
+                now = time.monotonic()
+                dt, self.last_time = now - self.last_time, now
+                self.reload_config(now)
+                if not self.cfg or not self.controls:
+                    time.sleep(1)
+                    continue
+                # Commands first, then manual controls, so a manual action in the
+                # same instant always wins
+                self.server.poll(self.handle_command)
+                self.handle_encoder()
+                self.read_switch(now)
+                self.render(now, dt)
+                time.sleep(FRAME_TIME)
+        finally:
+            self.strip.close(self.cfg)
+            if self.controls:
+                self.controls.close()
+            self.server.close()
 
 
 # --- Commands ---
+
+USAGE = """Usage: leds COMMAND
+
+  leds status            what is shown, and whether the switch/encoder or a command controls it
+  leds set STATE         show STATE until the switch or encoder is used
+                         STATE: off, rainbow, 1-4, or a position color (red, tlp:amber, ...)
+  leds reset             go back to the previous command (after the first one: manual control)
+  leds release           give control back to the switch and encoder right away
+  leds speed TURNS       rainbow speed in turns per second
+  leds identify          every 10th LED red, every 5th green (stop the service first)
+  leds run               run the controller (used by the leds service)
+
+Over SSH:  ssh pi@raspberrypi.local leds set tlp:amber"""
+
 
 def identify():
     cfg = load_config(CONF)
@@ -364,124 +691,22 @@ def identify():
     strip.close(cfg)
 
 
-def main():
-    running = True
-
-    def stop(*_):
-        nonlocal running
-        running = False
-    signal.signal(signal.SIGTERM, stop)
-    signal.signal(signal.SIGINT, stop)
-
-    strip = Strip()
-    events = queue.SimpleQueue()
-    cfg, controls, mtime, next_check = None, None, None, 0
-
-    now = time.monotonic()
-    position, closed, candidate, since = None, (), (), now
-    rainbow_mode, speed, phase = False, 0.0, 0.0
-    display = None  # None = off, 1-4 = switch position, "rainbow"
-    prev, trans_start = [], None
-    last_frame, sent_at, last_time = [], 0.0, now
-
-    while running:
-        now = time.monotonic()
-        dt, last_time = now - last_time, now
-
-        # Reload the config file when it changes
-        if now >= next_check:
-            next_check = now + 1
-            try:
-                m = os.stat(CONF).st_mtime
-                if m != mtime:
-                    mtime = m
-                    new = load_config(CONF)
-                    if not controls or not controls.matches(new):
-                        if controls:
-                            controls.close()
-                            controls = None
-                        controls = Controls(new, events)
-                        log(f"GPIO backend: {type(Device.pin_factory).__name__}")
-                    if cfg and cfg["led_count"] > new["led_count"]:
-                        strip.show([BLACK] * cfg["led_count"], cfg)  # clear the old tail
-                    if not cfg or new["rainbow_speed"] != cfg["rainbow_speed"]:
-                        speed = new["rainbow_speed"]
-                    cfg, last_frame = new, []
-                    log(f"Config loaded: {cfg['led_count']} LEDs, brightness {int(cfg['brightness'] * 100)}%, gamma {cfg['gamma']:g}, "
-                        f"switch pins {cfg['switch_pins']} (active {cfg['switch_active']}), "
-                        f"encoder pins {cfg['encoder_pins'] or 'none'}, transition {cfg['transition']}")
-            except ConfigError as e:
-                log(f"Config error in {CONF}: {e}" + (" (keeping previous settings)" if cfg else ""))
-            except Exception as e:  # file or GPIO problem
-                log(f"Error: {e} (retrying)")
-                mtime = None
-                next_check = now + 5
-        if not cfg or not controls:
-            time.sleep(1)
-            continue
-
-        # Encoder: press toggles rainbow mode, turning changes its speed
-        while True:
-            try:
-                event = events.get_nowait()
-            except queue.Empty:
-                break
-            if event == "press":
-                rainbow_mode = not rainbow_mode
-                log(f"Rainbow mode {'ON' if rainbow_mode else 'OFF'}")
-            elif rainbow_mode:
-                new_speed = round(min(SPEED_MAX, max(SPEED_MIN, speed + event * cfg["rainbow_step"])), 2)
-                if new_speed != speed:
-                    speed = new_speed
-                    log(f"Rainbow speed: {speed:g} turns/s")
-
-        # Debounced switch reading, always done so it is up to date when leaving rainbow mode
-        raw = controls.read_switch()
-        if raw != candidate:
-            candidate, since = raw, now
-        elif raw != closed and now - since >= (SETTLE if raw else OFF_SETTLE):
-            closed = raw
-            position = controls.position(closed)
-            log(f"Switch position: {position or 'none'}  (closed: "
-                f"{' '.join(f'GPIO{p}' for p in closed) or 'nothing'})")
-
-        # Start a transition whenever what should be shown changes
-        wanted = "rainbow" if rainbow_mode else position
-        if wanted != display:
-            display = wanted
-            log(f"Display: {describe(cfg, display)}")
-            prev, trans_start = last_frame, now
-
-        n = cfg["led_count"]
-        if display == "rainbow":
-            phase = (phase + speed * dt) % 1
-            target = rainbow_frame(n, phase, cfg["rainbow_brightness"])
-        else:
-            target = static_frame(cfg, display)
-
-        frame = target
-        if trans_start is not None:
-            duration = cfg["transition_ms"] / 1000
-            elapsed = now - trans_start
-            if cfg["transition"] == "none" or elapsed >= duration:
-                trans_start = None
-            else:
-                frame = transition_frame(cfg, fit(prev, n), target, elapsed / duration, elapsed)
-
-        # Re-sent regularly so a frame garbled on the data line doesn't stick
-        animated = trans_start is not None or display == "rainbow"
-        if animated or frame != last_frame or now - sent_at >= REFRESH:
-            strip.show(frame, cfg)
-            last_frame, sent_at = frame, now
-        time.sleep(FRAME_TIME)
-
-    strip.close(cfg)
-    if controls:
-        controls.close()
+def main(args):
+    if not args or args[0] in ("help", "-h", "--help"):
+        print(USAGE)
+        return 0
+    if args == ["run"]:
+        try:
+            App().run()
+        except RuntimeError as e:
+            log(f"Error: {e}")
+            return 1
+        return 0
+    if args == ["identify"]:
+        identify()
+        return 0
+    return send_command(args)
 
 
 if __name__ == "__main__":
-    if sys.argv[1:] == ["identify"]:
-        identify()
-    else:
-        main()
+    sys.exit(main(sys.argv[1:]))

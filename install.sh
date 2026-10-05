@@ -80,7 +80,7 @@ Description=LED strip controlled by a rotary switch and encoder
 
 [Service]
 User=$USER_NAME
-ExecStart=/usr/bin/python3 $DIR/leds.py
+ExecStart=/usr/bin/python3 $DIR/leds.py run
 Restart=always
 RestartSec=3
 
@@ -89,6 +89,13 @@ WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
 systemctl enable -q leds.service
+
+echo "==> Command line tool: leds (try: leds help)"
+cat > /usr/local/bin/leds <<EOF
+#!/bin/sh
+exec /usr/bin/python3 $DIR/leds.py "\$@"
+EOF
+chmod 755 /usr/local/bin/leds
 
 if [ $REBOOT = yes ]; then
     echo "==> Done. Boot settings changed, rebooting in 5 seconds (Ctrl+C to cancel)..."
