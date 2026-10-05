@@ -1,33 +1,51 @@
-# ============================================================
-#  LED strip settings  -  edit and save, changes apply within 1 second
-#  (no restart needed). Lines starting with # are ignored.
-# ============================================================
+# LED strip settings - edit and save, changes apply within 1 second
+# (no restart needed). Lines starting with # are ignored.
 
 # Total number of LEDs on the strip
-led_count = 60
+led_count = 16
 
 # Overall brightness in percent (1-100). Keep it low if your power supply is small.
 brightness = 50
 
+# Gamma correction so the LEDs show colors as they look on a screen.
+# 2.2 is a good default for WS2812B, 1.0 turns it off.
+gamma = 2.2
+
 # What each switch position lights up:
 #   positionN = FIRST-LAST COLOR
 # LED numbers start at 0, both ends are included.
-# COLOR is a name (white green orange red blue yellow purple cyan pink)
-# or R,G,B numbers 0-255, e.g.  255,80,0
-position1 = 0-9 white
-position2 = 10-19 green
-position3 = 20-29 orange
-position4 = 30-39 red
+# COLOR is a name or R,G,B numbers 0-255, e.g. 255,80,0
+#   TLP 2.0 official colors: tlp:red tlp:amber tlp:green tlp:clear
+#   other names: white red amber orange green blue yellow purple cyan pink
+position1 = 0-3 tlp:red
+position2 = 4-7 tlp:amber
+position3 = 8-11 tlp:green
+position4 = 12-15 tlp:clear
 
-# Rainbow shown when the switch is turned
-rainbow_seconds = 2
-# How fast the rainbow moves (full rainbow turns per second)
-rainbow_speed = 1
+# Animation played every time what is shown changes:
+#   glitch     retro signal dropouts and neon noise
+#   steampunk  old image cools to an ember glow, new one ignites in flickering copper
+#   rainbow    moving rainbow over the whole strip
+#   none       instant change
+transition = glitch
+transition_ms = 600
 
-# --- wiring, normally no need to change ---
-# GPIO numbers (BCM) for switch position 1 2 3 4. Each is connected to GND
-# through the switch when that position is selected.
+# Rainbow mode, toggled by pressing the encoder
+rainbow_speed = 0.4       # rainbow turns per second at startup
+rainbow_step = 0.1        # speed change per encoder click
+rainbow_brightness = 40   # percent, applied on top of brightness
+
+# --- wiring ---
+# GPIO numbers (BCM) for switch position 1 2 3 4
 switch_pins = 5 6 13 19
+# high: the switch common is on 3V3 (internal pull-downs)
+# low:  the switch common is on GND (internal pull-ups)
+switch_active = high
+
+# Encoder GPIO numbers (BCM): CLK DT SW. Leave empty if there is no encoder.
+encoder_pins = 20 21 26
+# yes if turning clockwise slows the rainbow down
+encoder_invert = no
 
 # Color byte order of the strip. WS2812B is GRB. If red and green are swapped, try RGB.
 color_order = GRB

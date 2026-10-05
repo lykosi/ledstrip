@@ -14,7 +14,16 @@ USER_NAME=${SUDO_USER:-$(stat -c %U "$DIR")}
 REBOOT=no
 
 echo "==> Installing packages"
-apt-get install -y -qq python3-spidev python3-gpiozero python3-lgpio >/dev/null
+apt-get update -qq
+apt-get install -y -qq python3-spidev python3-gpiozero >/dev/null
+# lgpio is the GPIO backend on current Raspberry Pi OS. Older releases don't
+# package it, so fall back to RPi.GPIO there (gpiozero picks whichever exists).
+if apt-get install -y -qq python3-lgpio >/dev/null 2>&1; then
+    echo "    GPIO backend: lgpio"
+else
+    apt-get install -y -qq python3-rpi.gpio >/dev/null
+    echo "    python3-lgpio not available on this OS, using RPi.GPIO instead"
+fi
 
 echo "==> Config file"
 if [ -f "$DIR/leds.conf" ]; then
@@ -29,11 +38,33 @@ chmod +x "$DIR/leds.py"
 echo "==> Boot settings (SPI on, stable core clock, big SPI buffer)"
 BOOT=/boot/firmware
 [ -f $BOOT/config.txt ] || BOOT=/boot
-if ! grep -q "^dtparam=spi=on" $BOOT/config.txt; then
-    cp -n $BOOT/config.txt $BOOT/config.txt.bak-leds
-    printf "\n[all]\n# LED strip (leds.service)\ndtparam=spi=on\ncore_freq=250\n" >> $BOOT/config.txt
-    REBOOT=yes
-fi
+CFG=$BOOT/config.txt
+MODEL=$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || true)
+echo "    board: ${MODEL:-unknown}"
+
+# Adds a line to config.txt if it is missing, under an [all] section of our own
+add_boot_line() {
+    if ! grep -qx "$1" $CFG; then
+        cp -n $CFG $CFG.bak-leds
+        grep -qx "# LED strip (leds.service)" $CFG || printf "\n[all]\n# LED strip (leds.service)\n" >> $CFG
+        echo "$1" >> $CFG
+        REBOOT=yes
+    fi
+}
+
+add_boot_line "dtparam=spi=on"
+# The SPI clock follows the core clock, which the Pi changes with load.
+# Pi 4 / 400 / CM4 need it fixed at 500 MHz, older boards at 250 MHz.
+case "$MODEL" in
+    *"Raspberry Pi 4"* | *"Raspberry Pi 400"* | *"Compute Module 4"*)
+        add_boot_line "core_freq=500"
+        add_boot_line "core_freq_min=500"
+        ;;
+    *)
+        add_boot_line "core_freq=250"
+        ;;
+esac
+
 if ! grep -q "spidev.bufsiz" $BOOT/cmdline.txt; then
     cp -n $BOOT/cmdline.txt $BOOT/cmdline.txt.bak-leds
     sed -i "1 s/\$/ spidev.bufsiz=65536/" $BOOT/cmdline.txt
@@ -45,7 +76,7 @@ usermod -aG spi,gpio "$USER_NAME"
 echo "==> Service (runs as $USER_NAME from $DIR)"
 cat > /etc/systemd/system/leds.service <<EOF
 [Unit]
-Description=LED strip controlled by 4-position switch
+Description=LED strip controlled by a rotary switch and encoder
 
 [Service]
 User=$USER_NAME
